@@ -29,6 +29,7 @@ import re
 import json
 import sys
 import argparse
+import logging
 from datetime import datetime
 from collections import OrderedDict, defaultdict
 
@@ -48,6 +49,7 @@ def parse_line(line):
     line = line.rstrip('\n')
     if not line.strip():
         return None
+    logging.debug("Parsing line: %s", line)
     m = LINE_RE.match(line)
     if not m:
         return {"raw": line, "parse_error": True}
@@ -78,8 +80,13 @@ def parse_log(path):
             parsed = parse_line(line)
             if parsed is None:
                 continue
+            if parsed.get("parse_error"):
+                logging.debug("Skipping parse error on line %d: %s", lineno, parsed.get("raw"))
+                continue
             parsed["lineno"] = lineno
+            logging.debug("Parsed line %d: %s", lineno, parsed)
             events.append(parsed)
+    logging.debug("Finished parsing log %s: %d events", path, len(events))
     return events
 
 
@@ -122,6 +129,7 @@ CATEGORY_GROUP = {
 
 def classify(event):
     msg = event.get("message", "")
+    logging.debug("Classifying message: %s", msg)
     for regex, code, label in COMPILED_RULES:
         if regex.search(msg):
             event["event_code"] = code
@@ -132,6 +140,13 @@ def classify(event):
         event["event_label"] = f"Unclassified: {msg[:60]}"
     cat = event.get("context", {}).get("category", "")
     event["group"] = CATEGORY_GROUP.get(cat, cat or "Unknown")
+    logging.debug(
+        "Classified event: line=%s code=%s label=%s group=%s",
+        event.get("lineno", "?"),
+        event["event_code"],
+        event["event_label"],
+        event["group"],
+    )
     return event
 
 
@@ -178,6 +193,13 @@ def correlate_ue_timelines(events):
         else:
             ue_key = "UNCORRELATED"
 
+        logging.debug(
+            "Correlating event line %d: amf_id=%s ran_addr=%s -> ue_key=%s",
+            ev.get("lineno", "?"),
+            amf_id,
+            ran_addr,
+            ue_key,
+        )
         timelines.setdefault(ue_key, []).append(ev)
         if ue_key != "UNCORRELATED":
             last_active_uekey = ue_key
@@ -293,6 +315,13 @@ def run_state_machine(ue_key, timeline, stuck_timeout_minutes=None):
             "from_state": state,
             "to_state": new_state,
         })
+        logging.debug(
+            "StateMachine %s line %s: %s -> %s",
+            ue_key,
+            ev.get("lineno", "?"),
+            state,
+            new_state,
+        )
         if not new_state.startswith("UNEXPECTED"):
             state = new_state
         last_ts = ts
@@ -317,6 +346,7 @@ def run_state_machine(ue_key, timeline, stuck_timeout_minutes=None):
         outcome["status"] = "STUCK"
         outcome["reason"] = f"UE stalled in intermediate state '{state}' with no further events — likely missing a response (timeout) or log truncation."
 
+    logging.debug("Outcome for %s: final_state=%s status=%s", ue_key, state, outcome["status"])
     return outcome
 
 
@@ -387,8 +417,11 @@ def main():
     ap.add_argument("logfile")
     ap.add_argument("--json", help="optional path to dump full structured results as JSON")
     args = ap.parse_args()
-
+    logging.basicConfig(level=logging.DEBUG)
+    logging.info("amf_log_analyzer.py: Parsing and analyzing log file: %s", args.logfile)
+    
     events = parse_log(args.logfile)
+    logging.info("Events parsed: %d", len(events))
     events = [classify(ev) for ev in events]
     timelines = correlate_ue_timelines(events)
     ue_meta = extract_ue_meta(timelines)
@@ -400,6 +433,7 @@ def main():
         outcomes.append(run_state_machine(ue_key, evs))
 
     report = generate_report(outcomes, ue_meta)
+    logging.info("Generated report")
     print(report)
 
     if args.json:
